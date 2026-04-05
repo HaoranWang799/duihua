@@ -20,7 +20,6 @@ export const GamePage = () => {
   const [isGeneratingStory, setIsGeneratingStory] = useState(false);
   const [preGeneratingChapterIds, setPreGeneratingChapterIds] = useState<string[]>([]);
   const [preGeneratedChapterIds, setPreGeneratedChapterIds] = useState<string[]>([]);
-  const [chapterAudioStatusById, setChapterAudioStatusById] = useState<Record<string, string>>({});
   const {
     hasStarted,
     currentNode,
@@ -65,16 +64,12 @@ export const GamePage = () => {
     const chapterId = currentChapterCacheKey;
 
     if (preGeneratedChapterIds.includes(chapterId)) {
-      return chapterAudioStatusById[chapterId] ?? '语音已缓存';
+      return '语音已缓存';
     }
 
     setPreGeneratingChapterIds((current) =>
       current.includes(chapterId) ? current : [...current, chapterId],
     );
-    setChapterAudioStatusById((current) => ({
-      ...current,
-      [chapterId]: `正在缓存《${currentChapter.title}》语音…`,
-    }));
 
     const texts = currentChapter.nodes
       .map((chapterNode) => activeStoryMap[chapterNode.id]?.subtitle ?? '')
@@ -90,21 +85,8 @@ export const GamePage = () => {
       setPreGeneratedChapterIds((current) =>
         current.includes(chapterId) ? current : [...current, chapterId],
       );
-      setChapterAudioStatusById((current) => ({
-        ...current,
-        [chapterId]: status,
-      }));
 
       return status;
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : '整章语音预生成失败。';
-
-      setChapterAudioStatusById((current) => ({
-        ...current,
-        [chapterId]: message,
-      }));
-      throw error;
     } finally {
       setPreGeneratingChapterIds((current) =>
         current.filter((item) => item !== chapterId),
@@ -172,7 +154,6 @@ export const GamePage = () => {
 
   return (
     <PlayScene
-      chapterAudioStatus={chapterAudioStatusById[currentChapterCacheKey] ?? null}
       currentChapterTitle={currentChapter.title}
       currentChapterId={currentChapter.id}
       hasPreGeneratedChapterAudio={preGeneratedChapterIds.includes(currentChapterCacheKey)}

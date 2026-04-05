@@ -15,7 +15,6 @@ import { PreferencesModal } from './PreferencesModal';
 import { Subtitle } from './Subtitle';
 
 type PlaySceneProps = {
-  chapterAudioStatus: string | null;
   currentChapterId: string;
   node: StoryNode;
   preferences: StoryPreferences;
@@ -39,7 +38,6 @@ type PlaySceneProps = {
 };
 
 export const PlayScene = ({
-  chapterAudioStatus,
   currentChapterId,
   node,
   preferences,
@@ -191,9 +189,6 @@ export const PlayScene = ({
         </section>
 
         <section className="play-scene__choices">
-          {chapterAudioStatus ? (
-            <p className="play-scene__status-banner">{chapterAudioStatus}</p>
-          ) : null}
           {isEnding && showChoices ? (
             <EndingScreen
               node={node}

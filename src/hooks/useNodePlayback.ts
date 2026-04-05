@@ -157,8 +157,29 @@ export const useNodePlayback = (
 
     const audio = new Audio(url);
     audio.preload = 'auto';
+    audio.autoplay = true;
     audio.muted = preferences.isMuted;
     audioRef.current = audio;
+
+    let hasStartedPlayback = false;
+
+    const tryStartPlayback = async () => {
+      if (hasStartedPlayback) {
+        return;
+      }
+
+      hasStartedPlayback = true;
+
+      try {
+        await audio.play();
+        setIsPlaying(true);
+        setIsPaused(false);
+      } catch {
+        hasStartedPlayback = false;
+        setIsPlaying(false);
+        setIsPaused(true);
+      }
+    };
 
     audio.addEventListener('loadedmetadata', async () => {
       const nextDuration =
@@ -168,15 +189,12 @@ export const useNodePlayback = (
       setDurationMs(nextDuration);
       setCurrentTime(0);
       setIsPreparingAudio(false);
+      void tryStartPlayback();
+    });
 
-      try {
-        await audio.play();
-        setIsPlaying(true);
-        setIsPaused(false);
-      } catch {
-        setIsPlaying(false);
-        setIsPaused(true);
-      }
+    audio.addEventListener('canplay', () => {
+      setIsPreparingAudio(false);
+      void tryStartPlayback();
     });
 
     audio.addEventListener('timeupdate', () => {
@@ -202,6 +220,11 @@ export const useNodePlayback = (
     });
 
     audio.load();
+
+    if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      setIsPreparingAudio(false);
+      void tryStartPlayback();
+    }
   }, [
     detachAudio,
     node,
