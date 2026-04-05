@@ -76,6 +76,7 @@ const STORY_GENERATION_INSTRUCTIONS = `
 11. 选择文案必须都是玩家口吻，且能明显导向不同的关系分支。
 12. 故事标题要短，像一部夜间互动片段的标题。
 13. summary 要用一句话概括这次生成的故事基调。
+14. subtitle 必须是角色正在对玩家说的话，优先使用第一人称和直接对话口吻，例如“我刚才一直在等你”“你怎么还不走”。不要写旁白、环境描写、镜头说明、舞台说明，不要用“雨夜的办公室，窗外大雨滂沱”这类开场。
 `.trim()
 
 const readBody = async (req) => {
@@ -188,6 +189,57 @@ const ensureGeneratedText = (value, label) => {
   return value.trim()
 }
 
+const looksLikeNarration = (subtitle) => {
+  const trimmed = `${subtitle ?? ''}`.trim()
+
+  if (!trimmed) {
+    return false
+  }
+
+  const narrationOpeners = [
+    /^雨夜/,
+    /^夜晚/,
+    /^深夜/,
+    /^办公室/,
+    /^房间/,
+    /^走廊/,
+    /^窗外/,
+    /^空气中/,
+    /^空气里/,
+    /^灯光/,
+    /^此刻/,
+    /^现在的/,
+  ]
+
+  if (narrationOpeners.some((pattern) => pattern.test(trimmed))) {
+    return true
+  }
+
+  const narrationMarkers = [
+    '你和',
+    '空气中',
+    '空气里',
+    '窗外',
+    '灯光',
+    '独处',
+    '弥漫着',
+    '潮湿的暖味',
+    '潮湿的暧昧',
+    '周围',
+    '场景',
+    '镜头',
+  ]
+
+  const hasDialogueMarkers =
+    trimmed.includes('我') ||
+    trimmed.includes('你') ||
+    trimmed.includes('吗') ||
+    trimmed.includes('？') ||
+    trimmed.includes('……')
+
+  return narrationMarkers.some((marker) => trimmed.includes(marker)) && !hasDialogueMarkers
+}
+
 const validateGeneratedStoryPayload = (payload) => {
   if (!payload || typeof payload !== 'object') {
     throw new Error('生成结果为空。')
@@ -209,6 +261,10 @@ const validateGeneratedStoryPayload = (payload) => {
     const subtitle = ensureGeneratedText(node.subtitle, `节点 ${id} 的台词`)
     const tone = ensureGeneratedText(node.tone, `节点 ${id} 的情绪`)
     const rawChoices = node.choices
+
+    if (looksLikeNarration(subtitle)) {
+      throw new Error(`节点 ${id} 的台词更像旁白，不像角色正在对玩家说话。`)
+    }
 
     if (!Array.isArray(rawChoices)) {
       throw new Error(`节点 ${id} 的 choices 缺失。`)
