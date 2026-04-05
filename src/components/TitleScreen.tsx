@@ -36,7 +36,7 @@ export const TitleScreen = ({
       <div className="title-screen__content">
         <div className="title-screen__brand">
           <span className="title-screen__brand-mark">✦</span>
-          <span className="title-screen__brand-name">欲望之扉</span>
+          <span className="title-screen__brand-name">欲望之扉 你的她</span>
         </div>
         <p className="eyebrow">The Noir Sanctuary</p>
         <h1>午夜余波</h1>

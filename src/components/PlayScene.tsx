@@ -92,7 +92,7 @@ export const PlayScene = ({
           <div className="play-scene__brand">
             <span className="play-scene__brand-mark">✦</span>
             <div>
-              <p className="play-scene__brand-title">欲望之扉</p>
+              <p className="play-scene__brand-title">欲望之扉 你的她</p>
               <p className="play-scene__scene-label">{visual.sceneLabel}</p>
             </div>
           </div>
