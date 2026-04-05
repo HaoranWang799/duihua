@@ -6,11 +6,20 @@ let archivePoolUrl = ''
 let archiveSetupPromise = null
 let bucketClient = null
 let bucketClientSignature = ''
+const GENERATED_STORY_LIBRARY_LIMIT = 32
 
 const ARCHIVE_TABLE_SQL = `
   CREATE TABLE IF NOT EXISTS story_archives (
     client_id TEXT PRIMARY KEY,
     snapshot JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+`
+
+const GENERATED_STORY_LIBRARY_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS generated_story_library (
+    story_id TEXT PRIMARY KEY,
+    experience JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
 `
@@ -39,7 +48,10 @@ const ensureArchiveTable = async (databaseUrl) => {
   }
 
   if (!archiveSetupPromise) {
-    archiveSetupPromise = pool.query(ARCHIVE_TABLE_SQL)
+    archiveSetupPromise = Promise.all([
+      pool.query(ARCHIVE_TABLE_SQL),
+      pool.query(GENERATED_STORY_LIBRARY_TABLE_SQL),
+    ])
   }
 
   await archiveSetupPromise
@@ -124,6 +136,95 @@ export const writeArchiveSnapshotToDatabase = async ({
   )
 
   return true
+}
+
+export const readGeneratedStoryLibraryFromDatabase = async ({
+  databaseUrl,
+  limit = 8,
+}) => {
+  const pool = await ensureArchiveTable(databaseUrl)
+
+  if (!pool) {
+    return []
+  }
+
+  const result = await pool.query(
+    `
+      SELECT experience
+      FROM generated_story_library
+      ORDER BY updated_at DESC
+      LIMIT $1
+    `,
+    [limit],
+  )
+
+  return result.rows
+    .map((row) => row.experience)
+    .filter(Boolean)
+}
+
+export const writeGeneratedStoryLibraryToDatabase = async ({
+  databaseUrl,
+  experiences,
+}) => {
+  const pool = await ensureArchiveTable(databaseUrl)
+
+  if (!pool || !Array.isArray(experiences) || experiences.length === 0) {
+    return false
+  }
+
+  const nextExperiences = experiences.filter(
+    (experience) =>
+      experience &&
+      typeof experience === 'object' &&
+      typeof experience.id === 'string' &&
+      experience.id.trim(),
+  )
+
+  if (nextExperiences.length === 0) {
+    return false
+  }
+
+  const client = await pool.connect()
+
+  try {
+    await client.query('BEGIN')
+
+    for (const experience of nextExperiences) {
+      await client.query(
+        `
+          INSERT INTO generated_story_library (story_id, experience, updated_at)
+          VALUES ($1, $2::jsonb, NOW())
+          ON CONFLICT (story_id)
+          DO UPDATE SET
+            experience = EXCLUDED.experience,
+            updated_at = NOW()
+        `,
+        [experience.id, JSON.stringify(experience)],
+      )
+    }
+
+    await client.query(
+      `
+        DELETE FROM generated_story_library
+        WHERE story_id IN (
+          SELECT story_id
+          FROM generated_story_library
+          ORDER BY updated_at DESC
+          OFFSET $1
+        )
+      `,
+      [GENERATED_STORY_LIBRARY_LIMIT],
+    )
+
+    await client.query('COMMIT')
+    return true
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 export const readBucketObject = async ({

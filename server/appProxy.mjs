@@ -3,8 +3,10 @@ import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import {
   readArchiveSnapshotFromDatabase,
+  readGeneratedStoryLibraryFromDatabase,
   readBucketObject,
   writeArchiveSnapshotToDatabase,
+  writeGeneratedStoryLibraryToDatabase,
   writeBucketObject,
 } from './persistence.mjs'
 
@@ -12,6 +14,8 @@ const FISH_AUDIO_API_URL = 'https://api.fish.audio/v1/tts'
 const XAI_RESPONSES_API_URL = 'https://api.x.ai/v1/responses'
 const FISH_AUDIO_CACHE_DIR = path.resolve(process.cwd(), '.cache', 'fish-audio')
 const CLIENT_COOKIE_NAME = 'duihua_client_id'
+const GENERATED_STORY_LIBRARY_READ_LIMIT = 8
+const fishAudioInflightRequests = new Map()
 
 const STORY_GENERATION_SCHEMA = {
   additionalProperties: false,
@@ -141,6 +145,23 @@ const getBucketCacheKey = ({
 
   return `fish-audio/${digest}.${format}`
 }
+
+const getFishAudioRequestKey = ({
+  format,
+  latency,
+  model,
+  normalize,
+  reference_id,
+  text,
+}) =>
+  JSON.stringify({
+    format,
+    latency,
+    model,
+    normalize,
+    reference_id,
+    text,
+  })
 
 export const buildSystemConfig = (env = process.env) => ({
   archive: {
@@ -414,6 +435,171 @@ const getClientId = (req, res) => {
   return nextClientId
 }
 
+const createEmptyArchiveSnapshot = () => ({
+  activeExperience: null,
+  activeProgress: null,
+  generatedExperiences: [],
+  unlockedEndingIds: [],
+})
+
+const resolveFishAudioRequest = ({ fishAudio, requestBody }) => {
+  const {
+    apiKey,
+    format = 'mp3',
+    latency = 'normal',
+    model,
+    normalize = true,
+    reference_id,
+    text,
+  } = requestBody
+
+  const resolvedApiKey = fishAudio.apiKey || apiKey || ''
+  const resolvedModel = fishAudio.model || model || ''
+  const resolvedReferenceId = fishAudio.referenceId || reference_id
+
+  return {
+    apiKey: resolvedApiKey,
+    cacheInput: {
+      format,
+      latency,
+      model: resolvedModel,
+      normalize,
+      reference_id: resolvedReferenceId,
+      text,
+    },
+    contentType: getAudioContentType(format),
+    format,
+    model: resolvedModel,
+    referenceId: resolvedReferenceId,
+    text,
+  }
+}
+
+const loadCachedFishAudio = async ({ bucket, cacheInput }) => {
+  const bucketCacheKey = getBucketCacheKey(cacheInput)
+  const bucketObject = await readBucketObject({
+    bucketConfig: bucket,
+    key: bucketCacheKey,
+  })
+
+  if (bucketObject) {
+    return {
+      buffer: bucketObject.body,
+      cacheSource: 'BUCKET',
+      contentType: bucketObject.contentType ?? getAudioContentType(cacheInput.format),
+    }
+  }
+
+  const cacheFilePath = getCacheFilePath(cacheInput)
+
+  try {
+    await stat(cacheFilePath)
+    const cachedAudio = await readFile(cacheFilePath)
+
+    return {
+      buffer: cachedAudio,
+      cacheSource: 'HIT',
+      contentType: getAudioContentType(cacheInput.format),
+    }
+  } catch {
+    return null
+  }
+}
+
+const synthesizeFishAudioToCache = async ({ bucket, fishAudio, requestBody }) => {
+  const resolvedRequest = resolveFishAudioRequest({ fishAudio, requestBody })
+  const { apiKey, cacheInput, contentType, model, referenceId, text } = resolvedRequest
+
+  if (!apiKey || !model || !text) {
+    throw new Error('缺少 Fish Audio 所需配置。')
+  }
+
+  const cacheHit = await loadCachedFishAudio({ bucket, cacheInput })
+
+  if (cacheHit) {
+    return cacheHit
+  }
+
+  const inflightKey = getFishAudioRequestKey(cacheInput)
+  const existingTask = fishAudioInflightRequests.get(inflightKey)
+
+  if (existingTask) {
+    return existingTask
+  }
+
+  const generationTask = (async () => {
+    const upstreamResponse = await fetch(FISH_AUDIO_API_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        model,
+      },
+      body: JSON.stringify({
+        format: cacheInput.format,
+        latency: cacheInput.latency,
+        normalize: cacheInput.normalize,
+        text,
+        ...(referenceId ? { reference_id: referenceId } : {}),
+      }),
+    })
+
+    if (!upstreamResponse.ok) {
+      throw new Error((await upstreamResponse.text()) || 'Fish Audio 生成失败。')
+    }
+
+    const responseContentType =
+      upstreamResponse.headers.get('content-type') ?? contentType
+    const arrayBuffer = await upstreamResponse.arrayBuffer()
+    const audioBuffer = Buffer.from(arrayBuffer)
+
+    await ensureCacheDirectory()
+    await writeFile(getCacheFilePath(cacheInput), audioBuffer)
+    await writeBucketObject({
+      body: audioBuffer,
+      bucketConfig: bucket,
+      contentType: responseContentType,
+      key: getBucketCacheKey(cacheInput),
+    })
+
+    return {
+      buffer: audioBuffer,
+      cacheSource: bucket.bucket ? 'MISS->BUCKET' : 'MISS',
+      contentType: responseContentType,
+    }
+  })()
+
+  fishAudioInflightRequests.set(inflightKey, generationTask)
+
+  try {
+    return await generationTask
+  } finally {
+    fishAudioInflightRequests.delete(inflightKey)
+  }
+}
+
+const preWarmGeneratedStoryAudio = async ({ bucket, fishAudio, story }) => {
+  if (!fishAudio.apiKey || !fishAudio.model || !story?.nodes?.length) {
+    return
+  }
+
+  const uniqueTexts = [
+    ...new Set(
+      story.nodes
+        .map((node) => `${node?.subtitle ?? ''}`.trim())
+        .filter(Boolean),
+    ),
+  ]
+
+  for (const text of uniqueTexts) {
+    await synthesizeFishAudioToCache({
+      bucket,
+      fishAudio,
+      requestBody: { text },
+    })
+  }
+}
+
 const createArchiveHandler = (archiveConfig) => async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.statusCode = 204
@@ -425,14 +611,27 @@ const createArchiveHandler = (archiveConfig) => async (req, res) => {
 
   if (req.method === 'GET') {
     try {
-      const snapshot = await readArchiveSnapshotFromDatabase({
-        clientId,
-        databaseUrl: archiveConfig.databaseUrl,
-      })
+      const [snapshot, generatedExperiences] = await Promise.all([
+        readArchiveSnapshotFromDatabase({
+          clientId,
+          databaseUrl: archiveConfig.databaseUrl,
+        }),
+        readGeneratedStoryLibraryFromDatabase({
+          databaseUrl: archiveConfig.databaseUrl,
+          limit: GENERATED_STORY_LIBRARY_READ_LIMIT,
+        }),
+      ])
+
+      const nextSnapshot = snapshot ?? createEmptyArchiveSnapshot()
+
+      if (generatedExperiences.length > 0) {
+        nextSnapshot.generatedExperiences = generatedExperiences
+      }
 
       sendJson(res, 200, {
         durable: Boolean(archiveConfig.databaseUrl),
-        snapshot,
+        snapshot:
+          snapshot || generatedExperiences.length > 0 ? nextSnapshot : null,
       })
     } catch (error) {
       sendJson(res, 500, {
@@ -465,8 +664,15 @@ const createArchiveHandler = (archiveConfig) => async (req, res) => {
       snapshot,
     })
 
+    const libraryPersisted = await writeGeneratedStoryLibraryToDatabase({
+      databaseUrl: archiveConfig.databaseUrl,
+      experiences: Array.isArray(snapshot.generatedExperiences)
+        ? snapshot.generatedExperiences
+        : [],
+    })
+
     sendJson(res, 200, {
-      durable: persisted,
+      durable: persisted || libraryPersisted,
       ok: true,
     })
   } catch (error) {
@@ -498,104 +704,17 @@ const createFishAudioHandler = ({ bucket, fishAudio }) => async (req, res) => {
 
   try {
     const rawBody = await readBody(req)
-    const {
-      apiKey,
-      format = 'mp3',
-      latency = 'normal',
-      model,
-      normalize = true,
-      reference_id,
-      text,
-    } = JSON.parse(rawBody)
-
-    const resolvedApiKey = fishAudio.apiKey || apiKey || ''
-    const resolvedModel = fishAudio.model || model || ''
-    const resolvedReferenceId = fishAudio.referenceId || reference_id
-
-    if (!resolvedApiKey || !resolvedModel || !text) {
-      sendJson(res, 400, { message: '缺少 Fish Audio 所需配置。' })
-      return
-    }
-
-    const cacheInput = {
-      format,
-      latency,
-      model: resolvedModel,
-      normalize,
-      reference_id: resolvedReferenceId,
-      text,
-    }
-    const cacheFilePath = getCacheFilePath(cacheInput)
-    const bucketCacheKey = getBucketCacheKey(cacheInput)
-
-    const bucketObject = await readBucketObject({
-      bucketConfig: bucket,
-      key: bucketCacheKey,
+    const requestBody = JSON.parse(rawBody)
+    const result = await synthesizeFishAudioToCache({
+      bucket,
+      fishAudio,
+      requestBody,
     })
 
-    if (bucketObject) {
-      res.statusCode = 200
-      res.setHeader(
-        'Content-Type',
-        bucketObject.contentType ?? getAudioContentType(format),
-      )
-      res.setHeader('X-Fish-Cache', 'BUCKET')
-      res.end(bucketObject.body)
-      return
-    }
-
-    try {
-      await stat(cacheFilePath)
-      const cachedAudio = await readFile(cacheFilePath)
-      res.statusCode = 200
-      res.setHeader('Content-Type', getAudioContentType(format))
-      res.setHeader('X-Fish-Cache', 'HIT')
-      res.end(cachedAudio)
-      return
-    } catch {
-      // Cache miss, continue.
-    }
-
-    const upstreamResponse = await fetch(FISH_AUDIO_API_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${resolvedApiKey}`,
-        'Content-Type': 'application/json',
-        model: resolvedModel,
-      },
-      body: JSON.stringify({
-        format,
-        latency,
-        normalize,
-        text,
-        ...(resolvedReferenceId ? { reference_id: resolvedReferenceId } : {}),
-      }),
-    })
-
-    res.statusCode = upstreamResponse.status
-    res.setHeader(
-      'Content-Type',
-      upstreamResponse.headers.get('content-type') ?? getAudioContentType(format),
-    )
-
-    if (!upstreamResponse.ok) {
-      res.end(await upstreamResponse.text())
-      return
-    }
-
-    const arrayBuffer = await upstreamResponse.arrayBuffer()
-    const audioBuffer = Buffer.from(arrayBuffer)
-    await ensureCacheDirectory()
-    await writeFile(cacheFilePath, audioBuffer)
-    await writeBucketObject({
-      body: audioBuffer,
-      bucketConfig: bucket,
-      contentType:
-        upstreamResponse.headers.get('content-type') ?? getAudioContentType(format),
-      key: bucketCacheKey,
-    })
-    res.setHeader('X-Fish-Cache', bucket.bucket ? 'MISS->BUCKET' : 'MISS')
-    res.end(audioBuffer)
+    res.statusCode = 200
+    res.setHeader('Content-Type', result.contentType)
+    res.setHeader('X-Fish-Cache', result.cacheSource)
+    res.end(result.buffer)
   } catch (error) {
     sendJson(res, 500, {
       message:
@@ -604,10 +723,10 @@ const createFishAudioHandler = ({ bucket, fishAudio }) => async (req, res) => {
   }
 }
 
-const createStoryGenerationHandler = (systemConfig) => async (req, res) => {
+const createStoryGenerationHandler = ({ bucket, fishAudio, xAIStory }) => async (req, res) => {
   if (req.method === 'GET') {
     sendJson(res, 200, {
-      configured: Boolean(systemConfig.apiKey),
+      configured: Boolean(xAIStory.apiKey),
     })
     return
   }
@@ -623,7 +742,7 @@ const createStoryGenerationHandler = (systemConfig) => async (req, res) => {
     return
   }
 
-  if (!systemConfig.apiKey) {
+  if (!xAIStory.apiKey) {
     sendJson(res, 400, {
       message: '当前没有可用的 AI 剧本生成配置。',
     })
@@ -645,13 +764,21 @@ const createStoryGenerationHandler = (systemConfig) => async (req, res) => {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         const payload = await requestGeneratedStoryPayload({
-          apiKey: systemConfig.apiKey,
+          apiKey: xAIStory.apiKey,
           keywords: promptKeywords,
-          model: systemConfig.model,
+          model: xAIStory.model,
           validationFeedback: lastValidationError,
         })
+        const validatedPayload = validateGeneratedStoryPayload(payload)
 
-        sendJson(res, 200, validateGeneratedStoryPayload(payload))
+        sendJson(res, 200, validatedPayload)
+        void preWarmGeneratedStoryAudio({
+          bucket,
+          fishAudio,
+          story: validatedPayload.story,
+        }).catch((warmupError) => {
+          console.error('自动预生成剧本语音失败:', warmupError)
+        })
         return
       } catch (error) {
         lastValidationError =
@@ -673,5 +800,5 @@ const createStoryGenerationHandler = (systemConfig) => async (req, res) => {
 export const createAppProxyHandlers = (systemConfig) => ({
   archive: createArchiveHandler(systemConfig.archive),
   fishAudio: createFishAudioHandler(systemConfig),
-  storyGeneration: createStoryGenerationHandler(systemConfig.xAIStory),
+  storyGeneration: createStoryGenerationHandler(systemConfig),
 })
