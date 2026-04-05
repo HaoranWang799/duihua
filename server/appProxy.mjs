@@ -180,6 +180,134 @@ const getResponseOutputText = (payload) => {
     .trim()
 }
 
+const ensureGeneratedText = (value, label) => {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`${label} 为空。`)
+  }
+
+  return value.trim()
+}
+
+const validateGeneratedStoryPayload = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('生成结果为空。')
+  }
+
+  const title = ensureGeneratedText(payload.title, '故事标题')
+  const summary = ensureGeneratedText(payload.summary, '故事摘要')
+
+  if (!payload.story || typeof payload.story !== 'object' || !Array.isArray(payload.story.nodes)) {
+    throw new Error('生成结果缺少有效的故事节点。')
+  }
+
+  const nodes = payload.story.nodes.map((node, index) => {
+    if (!node || typeof node !== 'object') {
+      throw new Error(`第 ${index + 1} 个节点格式不正确。`)
+    }
+
+    const id = ensureGeneratedText(node.id, '节点 id')
+    const subtitle = ensureGeneratedText(node.subtitle, `节点 ${id} 的台词`)
+    const tone = ensureGeneratedText(node.tone, `节点 ${id} 的情绪`)
+    const rawChoices = node.choices
+
+    if (!Array.isArray(rawChoices)) {
+      throw new Error(`节点 ${id} 的 choices 缺失。`)
+    }
+
+    return {
+      choices: rawChoices.map((choice, choiceIndex) => {
+        if (!choice || typeof choice !== 'object') {
+          throw new Error(`节点 ${id} 的第 ${choiceIndex + 1} 个选项格式不正确。`)
+        }
+
+        return {
+          next: ensureGeneratedText(choice.next, `节点 ${id} 的选项跳转`),
+          text: ensureGeneratedText(choice.text, `节点 ${id} 的选项文案`),
+        }
+      }),
+      id,
+      subtitle,
+      tone,
+    }
+  })
+
+  const nodeIds = new Set(nodes.map((node) => node.id))
+
+  if (!nodeIds.has('start')) {
+    throw new Error('生成结果缺少起始节点 start。')
+  }
+
+  if (nodeIds.size !== nodes.length) {
+    throw new Error('生成结果里出现了重复节点 id。')
+  }
+
+  for (const node of nodes) {
+    for (const choice of node.choices) {
+      if (!nodeIds.has(choice.next)) {
+        throw new Error(`节点 ${node.id} 指向了不存在的节点 ${choice.next}。`)
+      }
+    }
+  }
+
+  const endingCount = nodes.filter((node) => node.choices.length === 0).length
+
+  if (endingCount < 3) {
+    throw new Error('生成结果的结局数量太少。')
+  }
+
+  return {
+    story: { nodes },
+    summary,
+    title,
+  }
+}
+
+const requestGeneratedStoryPayload = async ({ keywords, model, apiKey, validationFeedback }) => {
+  const inputParts = [
+    `请根据这些关键词生成新的分支故事：${keywords}`,
+  ]
+
+  if (validationFeedback) {
+    inputParts.push(`上一次结果的结构错误是：${validationFeedback}。这次必须彻底修复后再输出。`)
+  }
+
+  const upstreamResponse = await fetch(XAI_RESPONSES_API_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      input: inputParts.join('\n'),
+      instructions: STORY_GENERATION_INSTRUCTIONS,
+      model,
+      store: false,
+      text: {
+        format: {
+          name: 'generated_story_payload',
+          schema: STORY_GENERATION_SCHEMA,
+          strict: true,
+          type: 'json_schema',
+        },
+      },
+    }),
+  })
+
+  if (!upstreamResponse.ok) {
+    const errorText = await upstreamResponse.text()
+    throw new Error(errorText || 'AI 剧本生成失败。')
+  }
+
+  const responsePayload = await upstreamResponse.json()
+  const outputText = getResponseOutputText(responsePayload)
+
+  if (!outputText) {
+    throw new Error('AI 已返回结果，但没有解析到可用剧本。')
+  }
+
+  return JSON.parse(outputText)
+}
+
 const parseCookies = (rawCookieHeader) =>
   `${rawCookieHeader ?? ''}`
     .split(';')
@@ -456,47 +584,28 @@ const createStoryGenerationHandler = (systemConfig) => async (req, res) => {
       return
     }
 
-    const upstreamResponse = await fetch(XAI_RESPONSES_API_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${systemConfig.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        input: `请根据这些关键词生成新的分支故事：${promptKeywords}`,
-        instructions: STORY_GENERATION_INSTRUCTIONS,
-        model: systemConfig.model,
-        store: false,
-        text: {
-          format: {
-            name: 'generated_story_payload',
-            schema: STORY_GENERATION_SCHEMA,
-            strict: true,
-            type: 'json_schema',
-          },
-        },
-      }),
+    let lastValidationError = ''
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const payload = await requestGeneratedStoryPayload({
+          apiKey: systemConfig.apiKey,
+          keywords: promptKeywords,
+          model: systemConfig.model,
+          validationFeedback: lastValidationError,
+        })
+
+        sendJson(res, 200, validateGeneratedStoryPayload(payload))
+        return
+      } catch (error) {
+        lastValidationError =
+          error instanceof Error ? error.message : '生成结果结构不完整。'
+      }
+    }
+
+    sendJson(res, 502, {
+      message: `AI 连续三次返回了结构不完整的剧本：${lastValidationError}`,
     })
-
-    if (!upstreamResponse.ok) {
-      const errorText = await upstreamResponse.text()
-      sendJson(res, upstreamResponse.status, {
-        message: errorText || 'AI 剧本生成失败。',
-      })
-      return
-    }
-
-    const responsePayload = await upstreamResponse.json()
-    const outputText = getResponseOutputText(responsePayload)
-
-    if (!outputText) {
-      sendJson(res, 502, {
-        message: 'AI 已返回结果，但没有解析到可用剧本。',
-      })
-      return
-    }
-
-    sendJson(res, 200, JSON.parse(outputText))
   } catch (error) {
     sendJson(res, 500, {
       message:
