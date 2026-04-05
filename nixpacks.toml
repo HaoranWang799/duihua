@@ -1,0 +1,5 @@
+[variables]
+NIXPACKS_SPA_CADDY = 'false'
+
+[start]
+cmd = 'npm run start'
