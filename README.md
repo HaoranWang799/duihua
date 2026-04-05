@@ -32,6 +32,15 @@ npm install
 npm run dev
 ```
 
+## AI story generation
+
+Create a `.env.local` file and configure Grok:
+
+```bash
+XAI_API_KEY=your_xai_api_key
+XAI_STORY_MODEL=grok-4-1-fast-non-reasoning
+```
+
 ## Demo audio
 
 Demo audio files live in `public/audio/story/`.

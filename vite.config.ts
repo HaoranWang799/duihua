@@ -6,7 +6,7 @@ import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 
 const FISH_AUDIO_API_URL = 'https://api.fish.audio/v1/tts'
-const OPENAI_RESPONSES_API_URL = 'https://api.openai.com/v1/responses'
+const XAI_RESPONSES_API_URL = 'https://api.x.ai/v1/responses'
 const FISH_AUDIO_CACHE_DIR = path.resolve(
   process.cwd(),
   '.cache',
@@ -19,14 +19,14 @@ type FishAudioSystemConfig = {
   referenceId: string
 }
 
-type OpenAIStoryConfig = {
+type XAIStoryConfig = {
   apiKey: string
   model: string
 }
 
 type AppSystemConfig = {
   fishAudio: FishAudioSystemConfig
-  openAIStory: OpenAIStoryConfig
+  xAIStory: XAIStoryConfig
 }
 
 type Middleware = (
@@ -164,14 +164,18 @@ const getSystemConfig = (mode: string): AppSystemConfig => {
       model: (env.FISH_AUDIO_MODEL ?? '').trim(),
       referenceId: (env.FISH_AUDIO_VOICE_CARD_ID ?? '').trim(),
     },
-    openAIStory: {
-      apiKey: (env.OPENAI_API_KEY ?? '').trim(),
-      model: (env.OPENAI_STORY_MODEL ?? 'gpt-4.1-mini').trim(),
+    xAIStory: {
+      apiKey: (env.XAI_API_KEY ?? env.OPENAI_API_KEY ?? '').trim(),
+      model: (
+        env.XAI_STORY_MODEL ??
+        env.OPENAI_STORY_MODEL ??
+        'grok-4-1-fast-non-reasoning'
+      ).trim(),
     },
   }
 }
 
-const getOpenAIOutputText = (payload: unknown) => {
+const getResponseOutputText = (payload: unknown) => {
   if (!payload || typeof payload !== 'object') {
     return ''
   }
@@ -313,7 +317,7 @@ const fishAudioProxyMiddleware = async (
 const storyGenerationMiddleware = async (
   req: IncomingMessage,
   res: ServerResponse,
-  systemConfig: OpenAIStoryConfig,
+  systemConfig: XAIStoryConfig,
 ) => {
   if (req.method === 'GET') {
     sendJson(res, 200, {
@@ -350,7 +354,7 @@ const storyGenerationMiddleware = async (
       return
     }
 
-    const upstreamResponse = await fetch(OPENAI_RESPONSES_API_URL, {
+    const upstreamResponse = await fetch(XAI_RESPONSES_API_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${systemConfig.apiKey}`,
@@ -381,7 +385,7 @@ const storyGenerationMiddleware = async (
     }
 
     const responsePayload = (await upstreamResponse.json()) as unknown
-    const outputText = getOpenAIOutputText(responsePayload)
+    const outputText = getResponseOutputText(responsePayload)
 
     if (!outputText) {
       sendJson(res, 502, {
@@ -409,7 +413,7 @@ const appProxyPlugin = (systemConfig: AppSystemConfig) => ({
       fishAudioProxyMiddleware(req, res, systemConfig.fishAudio),
     )
     server.middlewares.use('/api/story/generate', (req, res) =>
-      storyGenerationMiddleware(req, res, systemConfig.openAIStory),
+      storyGenerationMiddleware(req, res, systemConfig.xAIStory),
     )
   },
   configureServer(server: {
@@ -421,7 +425,7 @@ const appProxyPlugin = (systemConfig: AppSystemConfig) => ({
       fishAudioProxyMiddleware(req, res, systemConfig.fishAudio),
     )
     server.middlewares.use('/api/story/generate', (req, res) =>
-      storyGenerationMiddleware(req, res, systemConfig.openAIStory),
+      storyGenerationMiddleware(req, res, systemConfig.xAIStory),
     )
   },
   name: 'app-proxy',
