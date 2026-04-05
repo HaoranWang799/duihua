@@ -72,6 +72,16 @@ export const useNodePlayback = (
     window.cancelAnimationFrame(frameRef.current);
   }, []);
 
+  const ensureAudioElement = useCallback(() => {
+    if (!audioRef.current) {
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audioRef.current = audio;
+    }
+
+    return audioRef.current;
+  }, []);
+
   const revokeAudioUrl = useCallback(() => {
     if (!audioUrlRef.current) {
       return;
@@ -89,9 +99,13 @@ export const useNodePlayback = (
     }
 
     audio.pause();
-    audio.src = '';
+    audio.onloadedmetadata = null;
+    audio.oncanplay = null;
+    audio.ontimeupdate = null;
+    audio.onended = null;
+    audio.onerror = null;
+    audio.removeAttribute('src');
     audio.load();
-    audioRef.current = null;
   }, []);
 
   const clearPlaybackResources = useCallback(() => {
@@ -155,11 +169,9 @@ export const useNodePlayback = (
     const url = URL.createObjectURL(blob);
     audioUrlRef.current = url;
 
-    const audio = new Audio(url);
-    audio.preload = 'auto';
+    const audio = ensureAudioElement();
     audio.autoplay = true;
     audio.muted = preferences.isMuted;
-    audioRef.current = audio;
 
     let hasStartedPlayback = false;
 
@@ -181,7 +193,7 @@ export const useNodePlayback = (
       }
     };
 
-    audio.addEventListener('loadedmetadata', async () => {
+    audio.onloadedmetadata = async () => {
       const nextDuration =
         Number.isFinite(audio.duration) && audio.duration > 0
           ? audio.duration * 1000
@@ -190,18 +202,18 @@ export const useNodePlayback = (
       setCurrentTime(0);
       setIsPreparingAudio(false);
       void tryStartPlayback();
-    });
+    };
 
-    audio.addEventListener('canplay', () => {
+    audio.oncanplay = () => {
       setIsPreparingAudio(false);
       void tryStartPlayback();
-    });
+    };
 
-    audio.addEventListener('timeupdate', () => {
+    audio.ontimeupdate = () => {
       setCurrentTime(audio.currentTime * 1000);
-    });
+    };
 
-    audio.addEventListener('ended', () => {
+    audio.onended = () => {
       setCurrentTime(
         Number.isFinite(audio.duration) && audio.duration > 0
           ? audio.duration * 1000
@@ -210,16 +222,18 @@ export const useNodePlayback = (
       setIsPlaying(false);
       setIsPaused(false);
       revealChoicesLater();
-    });
+    };
 
-    audio.addEventListener('error', () => {
+    audio.onerror = () => {
       setVoiceError('Fish Audio 音频播放失败，已退回无声模式。');
       detachAudio();
       revokeAudioUrl();
       startTimedPlayback(0);
-    });
+    };
 
+    audio.src = url;
     audio.load();
+    void tryStartPlayback();
 
     if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
       setIsPreparingAudio(false);
@@ -227,6 +241,7 @@ export const useNodePlayback = (
     }
   }, [
     detachAudio,
+    ensureAudioElement,
     node,
     preferences.isMuted,
     revealChoicesLater,
