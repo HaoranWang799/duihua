@@ -18,6 +18,9 @@ const appProxyPlugin = (mode: string) => {
       use: (path: string, fn: Middleware) => void
     }
   }) => {
+    server.middlewares.use('/api/archive', (req, res) =>
+      handlers.archive(req, res),
+    )
     server.middlewares.use('/api/fish/tts', (req, res) =>
       handlers.fishAudio(req, res),
     )

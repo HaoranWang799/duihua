@@ -62,6 +62,11 @@ const server = createServer(async (req, res) => {
     return
   }
 
+  if (pathname === '/api/archive') {
+    await handlers.archive(req, res)
+    return
+  }
+
   if (pathname === '/api/fish/tts') {
     await handlers.fishAudio(req, res)
     return

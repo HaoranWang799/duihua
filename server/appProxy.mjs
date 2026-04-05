@@ -1,10 +1,17 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import {
+  readArchiveSnapshotFromDatabase,
+  readBucketObject,
+  writeArchiveSnapshotToDatabase,
+  writeBucketObject,
+} from './persistence.mjs'
 
 const FISH_AUDIO_API_URL = 'https://api.fish.audio/v1/tts'
 const XAI_RESPONSES_API_URL = 'https://api.x.ai/v1/responses'
 const FISH_AUDIO_CACHE_DIR = path.resolve(process.cwd(), '.cache', 'fish-audio')
+const CLIENT_COOKIE_NAME = 'duihua_client_id'
 
 const STORY_GENERATION_SCHEMA = {
   additionalProperties: false,
@@ -119,7 +126,32 @@ const getCacheFilePath = ({
   return path.join(FISH_AUDIO_CACHE_DIR, `${digest}.${format}`)
 }
 
+const getBucketCacheKey = ({
+  format,
+  latency,
+  model,
+  normalize,
+  reference_id,
+  text,
+}) => {
+  const digest = createHash('sha256')
+    .update(JSON.stringify({ format, latency, model, normalize, reference_id, text }))
+    .digest('hex')
+
+  return `fish-audio/${digest}.${format}`
+}
+
 export const buildSystemConfig = (env = process.env) => ({
+  archive: {
+    databaseUrl: `${env.DATABASE_URL ?? ''}`.trim(),
+  },
+  bucket: {
+    accessKeyId: `${env.ACCESS_KEY_ID ?? ''}`.trim(),
+    bucket: `${env.BUCKET ?? ''}`.trim(),
+    endpoint: `${env.ENDPOINT ?? ''}`.trim(),
+    region: `${env.REGION ?? ''}`.trim(),
+    secretAccessKey: `${env.SECRET_ACCESS_KEY ?? ''}`.trim(),
+  },
   fishAudio: {
     apiKey: `${env.FISH_AUDIO_API_KEY ?? ''}`.trim(),
     model: `${env.FISH_AUDIO_MODEL ?? ''}`.trim(),
@@ -148,10 +180,123 @@ const getResponseOutputText = (payload) => {
     .trim()
 }
 
-const createFishAudioHandler = (systemConfig) => async (req, res) => {
+const parseCookies = (rawCookieHeader) =>
+  `${rawCookieHeader ?? ''}`
+    .split(';')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .reduce((cookies, entry) => {
+      const separatorIndex = entry.indexOf('=')
+
+      if (separatorIndex === -1) {
+        return cookies
+      }
+
+      const key = entry.slice(0, separatorIndex).trim()
+      const value = entry.slice(separatorIndex + 1).trim()
+
+      if (key) {
+        cookies[key] = decodeURIComponent(value)
+      }
+
+      return cookies
+    }, {})
+
+const getClientId = (req, res) => {
+  const cookies = parseCookies(req.headers.cookie)
+  const existingClientId = cookies[CLIENT_COOKIE_NAME]
+
+  if (existingClientId) {
+    return existingClientId
+  }
+
+  const nextClientId = randomUUID()
+  const isSecure =
+    `${req.headers['x-forwarded-proto'] ?? ''}`.split(',')[0].trim() === 'https'
+
+  const parts = [
+    `${CLIENT_COOKIE_NAME}=${encodeURIComponent(nextClientId)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=31536000',
+  ]
+
+  if (isSecure) {
+    parts.push('Secure')
+  }
+
+  res.setHeader('Set-Cookie', parts.join('; '))
+  return nextClientId
+}
+
+const createArchiveHandler = (archiveConfig) => async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204
+    res.end()
+    return
+  }
+
+  const clientId = getClientId(req, res)
+
+  if (req.method === 'GET') {
+    try {
+      const snapshot = await readArchiveSnapshotFromDatabase({
+        clientId,
+        databaseUrl: archiveConfig.databaseUrl,
+      })
+
+      sendJson(res, 200, {
+        durable: Boolean(archiveConfig.databaseUrl),
+        snapshot,
+      })
+    } catch (error) {
+      sendJson(res, 500, {
+        durable: false,
+        message: error instanceof Error ? error.message : '读取远端档案失败。',
+        snapshot: null,
+      })
+    }
+
+    return
+  }
+
+  if (req.method !== 'PUT') {
+    sendJson(res, 405, { message: 'Method Not Allowed' })
+    return
+  }
+
+  try {
+    const rawBody = await readBody(req)
+    const { snapshot } = JSON.parse(rawBody)
+
+    if (!snapshot || typeof snapshot !== 'object') {
+      sendJson(res, 400, { message: '缺少有效档案。' })
+      return
+    }
+
+    const persisted = await writeArchiveSnapshotToDatabase({
+      clientId,
+      databaseUrl: archiveConfig.databaseUrl,
+      snapshot,
+    })
+
+    sendJson(res, 200, {
+      durable: persisted,
+      ok: true,
+    })
+  } catch (error) {
+    sendJson(res, 500, {
+      durable: false,
+      message: error instanceof Error ? error.message : '保存远端档案失败。',
+    })
+  }
+}
+
+const createFishAudioHandler = ({ bucket, fishAudio }) => async (req, res) => {
   if (req.method === 'GET') {
     sendJson(res, 200, {
-      configured: Boolean(systemConfig.apiKey && systemConfig.model),
+      configured: Boolean(fishAudio.apiKey && fishAudio.model),
     })
     return
   }
@@ -179,23 +324,41 @@ const createFishAudioHandler = (systemConfig) => async (req, res) => {
       text,
     } = JSON.parse(rawBody)
 
-    const resolvedApiKey = systemConfig.apiKey || apiKey || ''
-    const resolvedModel = systemConfig.model || model || ''
-    const resolvedReferenceId = systemConfig.referenceId || reference_id
+    const resolvedApiKey = fishAudio.apiKey || apiKey || ''
+    const resolvedModel = fishAudio.model || model || ''
+    const resolvedReferenceId = fishAudio.referenceId || reference_id
 
     if (!resolvedApiKey || !resolvedModel || !text) {
       sendJson(res, 400, { message: '缺少 Fish Audio 所需配置。' })
       return
     }
 
-    const cacheFilePath = getCacheFilePath({
+    const cacheInput = {
       format,
       latency,
       model: resolvedModel,
       normalize,
       reference_id: resolvedReferenceId,
       text,
+    }
+    const cacheFilePath = getCacheFilePath(cacheInput)
+    const bucketCacheKey = getBucketCacheKey(cacheInput)
+
+    const bucketObject = await readBucketObject({
+      bucketConfig: bucket,
+      key: bucketCacheKey,
     })
+
+    if (bucketObject) {
+      res.statusCode = 200
+      res.setHeader(
+        'Content-Type',
+        bucketObject.contentType ?? getAudioContentType(format),
+      )
+      res.setHeader('X-Fish-Cache', 'BUCKET')
+      res.end(bucketObject.body)
+      return
+    }
 
     try {
       await stat(cacheFilePath)
@@ -240,7 +403,14 @@ const createFishAudioHandler = (systemConfig) => async (req, res) => {
     const audioBuffer = Buffer.from(arrayBuffer)
     await ensureCacheDirectory()
     await writeFile(cacheFilePath, audioBuffer)
-    res.setHeader('X-Fish-Cache', 'MISS')
+    await writeBucketObject({
+      body: audioBuffer,
+      bucketConfig: bucket,
+      contentType:
+        upstreamResponse.headers.get('content-type') ?? getAudioContentType(format),
+      key: bucketCacheKey,
+    })
+    res.setHeader('X-Fish-Cache', bucket.bucket ? 'MISS->BUCKET' : 'MISS')
     res.end(audioBuffer)
   } catch (error) {
     sendJson(res, 500, {
@@ -329,12 +499,14 @@ const createStoryGenerationHandler = (systemConfig) => async (req, res) => {
     sendJson(res, 200, JSON.parse(outputText))
   } catch (error) {
     sendJson(res, 500, {
-      message: error instanceof Error ? error.message : 'AI 剧本生成失败。',
+      message:
+        error instanceof Error ? error.message : 'AI 剧本生成失败。',
     })
   }
 }
 
 export const createAppProxyHandlers = (systemConfig) => ({
-  fishAudio: createFishAudioHandler(systemConfig.fishAudio),
+  archive: createArchiveHandler(systemConfig.archive),
+  fishAudio: createFishAudioHandler(systemConfig),
   storyGeneration: createStoryGenerationHandler(systemConfig.xAIStory),
 })

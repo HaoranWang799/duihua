@@ -1,6 +1,11 @@
+import type { Dispatch, SetStateAction } from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { DEFAULT_STORY_TITLE, story as defaultStory } from '../data/story';
 import type { StoryExperience, StoryProgress } from '../types/story';
+import {
+  fetchArchiveSnapshot,
+  persistArchiveSnapshot,
+} from '../utils/archiveApi';
 import { getEndingTitle, isEndingNode } from '../utils/storyRuntime';
 import {
   normalizeStoredStoryExperience,
@@ -19,6 +24,42 @@ const defaultStoryExperience: StoryExperience = {
   story: defaultStory,
   summary: '一段在黑暗中缓慢显形的互动叙事。',
   title: DEFAULT_STORY_TITLE,
+};
+
+const applyArchiveSnapshotToState = ({
+  setGeneratedStoryExperiences,
+  setProgress,
+  setResumeProgress,
+  setResumeStoryExperience,
+  setStoryExperience,
+  setUnlockedEndingIds,
+  snapshot,
+}: {
+  setGeneratedStoryExperiences: Dispatch<SetStateAction<StoryExperience[]>>;
+  setProgress: Dispatch<SetStateAction<StoryProgress>>;
+  setResumeProgress: Dispatch<SetStateAction<StoryProgress | null>>;
+  setResumeStoryExperience: Dispatch<SetStateAction<StoryExperience | null>>;
+  setStoryExperience: Dispatch<SetStateAction<StoryExperience>>;
+  setUnlockedEndingIds: Dispatch<SetStateAction<string[]>>;
+  snapshot: ReturnType<typeof readArchiveSnapshot>;
+}) => {
+  const restoredStoryExperience =
+    normalizeStoredStoryExperience(snapshot.activeExperience) ??
+    defaultStoryExperience;
+
+  setStoryExperience(restoredStoryExperience);
+  setProgress(
+    snapshot.activeProgress ??
+      createInitialStoryProgress(restoredStoryExperience.story),
+  );
+  setResumeStoryExperience(
+    normalizeStoredStoryExperience(snapshot.activeExperience),
+  );
+  setResumeProgress(snapshot.activeProgress ?? null);
+  setGeneratedStoryExperiences(
+    normalizeStoredStoryExperiences(snapshot.generatedExperiences),
+  );
+  setUnlockedEndingIds(snapshot.unlockedEndingIds ?? []);
 };
 
 export const useStoryEngine = () => {
@@ -46,6 +87,7 @@ export const useStoryEngine = () => {
   const [unlockedEndingIds, setUnlockedEndingIds] = useState<string[]>(
     archiveSnapshot.unlockedEndingIds,
   );
+  const [isArchiveHydrated, setIsArchiveHydrated] = useState(false);
   const storyNodeMap = useMemo(
     () => createStoryNodeMap(storyExperience.story),
     [storyExperience.story],
@@ -59,13 +101,64 @@ export const useStoryEngine = () => {
   );
 
   useEffect(() => {
-    writeArchiveSnapshot({
+    let isCancelled = false;
+
+    void fetchArchiveSnapshot()
+      .then((response) => {
+        if (isCancelled) {
+          return;
+        }
+
+        if (response.snapshot) {
+          applyArchiveSnapshotToState({
+            setGeneratedStoryExperiences,
+            setProgress,
+            setResumeProgress,
+            setResumeStoryExperience,
+            setStoryExperience,
+            setUnlockedEndingIds,
+            snapshot: response.snapshot,
+          });
+        }
+      })
+      .catch(() => {
+        // Keep local archive as fallback.
+      })
+      .finally(() => {
+        if (!isCancelled) {
+          setIsArchiveHydrated(true);
+        }
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const nextSnapshot = {
       activeExperience: resumeStoryExperience,
       activeProgress: resumeProgress,
       generatedExperiences: generatedStoryExperiences,
       unlockedEndingIds,
+    };
+
+    writeArchiveSnapshot(nextSnapshot);
+
+    if (!isArchiveHydrated) {
+      return;
+    }
+
+    void persistArchiveSnapshot(nextSnapshot).catch(() => {
+      // Keep local archive even if remote persistence fails temporarily.
     });
-  }, [generatedStoryExperiences, resumeProgress, resumeStoryExperience, unlockedEndingIds]);
+  }, [
+    generatedStoryExperiences,
+    isArchiveHydrated,
+    resumeProgress,
+    resumeStoryExperience,
+    unlockedEndingIds,
+  ]);
 
   const start = () => {
     const nextProgress = createInitialStoryProgress(defaultStoryExperience.story);

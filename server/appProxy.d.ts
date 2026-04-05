@@ -11,7 +11,21 @@ export type XAIStoryConfig = {
   model: string
 }
 
+export type ArchiveSystemConfig = {
+  databaseUrl: string
+}
+
+export type BucketSystemConfig = {
+  accessKeyId: string
+  bucket: string
+  endpoint: string
+  region: string
+  secretAccessKey: string
+}
+
 export type AppSystemConfig = {
+  archive: ArchiveSystemConfig
+  bucket: BucketSystemConfig
   fishAudio: FishAudioSystemConfig
   xAIStory: XAIStoryConfig
 }
@@ -27,6 +41,10 @@ export declare const buildSystemConfig: (
 ) => AppSystemConfig
 
 export declare const createAppProxyHandlers: (systemConfig: AppSystemConfig) => {
+  archive: (
+    req: IncomingMessage,
+    res: ServerResponse,
+  ) => void | Promise<void>
   fishAudio: (
     req: IncomingMessage,
     res: ServerResponse,
