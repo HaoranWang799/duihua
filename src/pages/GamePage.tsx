@@ -18,6 +18,9 @@ export const GamePage = () => {
   const [generationKeywords, setGenerationKeywords] = useState('');
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [isGeneratingStory, setIsGeneratingStory] = useState(false);
+  const [preGeneratingChapterIds, setPreGeneratingChapterIds] = useState<string[]>([]);
+  const [preGeneratedChapterIds, setPreGeneratedChapterIds] = useState<string[]>([]);
+  const [chapterAudioStatusById, setChapterAudioStatusById] = useState<Record<string, string>>({});
   const {
     hasStarted,
     currentNode,
@@ -56,17 +59,57 @@ export const GamePage = () => {
   const currentChapter =
     (currentChapterId ? storyMapLayout.chapterMap[currentChapterId] : undefined) ??
     storyMapLayout.chapters[0];
+  const currentChapterCacheKey = `${storyExperience.id}:${currentChapter.id}`;
 
   const handlePreGenerateChapterAudio = async () => {
+    const chapterId = currentChapterCacheKey;
+
+    if (preGeneratedChapterIds.includes(chapterId)) {
+      return chapterAudioStatusById[chapterId] ?? '语音已缓存';
+    }
+
+    setPreGeneratingChapterIds((current) =>
+      current.includes(chapterId) ? current : [...current, chapterId],
+    );
+    setChapterAudioStatusById((current) => ({
+      ...current,
+      [chapterId]: `正在缓存《${currentChapter.title}》语音…`,
+    }));
+
     const texts = currentChapter.nodes
       .map((chapterNode) => activeStoryMap[chapterNode.id]?.subtitle ?? '')
       .filter(Boolean);
-    const count = await preGenerateFishAudioTexts({
-      config: preferences.fishAudio,
-      texts,
-    });
 
-    return `《${currentChapter.title}》已缓存 ${count} 段语音。`;
+    try {
+      const count = await preGenerateFishAudioTexts({
+        config: preferences.fishAudio,
+        texts,
+      });
+      const status = count > 0 ? '语音已缓存' : '当前章节没有可缓存语音';
+
+      setPreGeneratedChapterIds((current) =>
+        current.includes(chapterId) ? current : [...current, chapterId],
+      );
+      setChapterAudioStatusById((current) => ({
+        ...current,
+        [chapterId]: status,
+      }));
+
+      return status;
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : '整章语音预生成失败。';
+
+      setChapterAudioStatusById((current) => ({
+        ...current,
+        [chapterId]: message,
+      }));
+      throw error;
+    } finally {
+      setPreGeneratingChapterIds((current) =>
+        current.filter((item) => item !== chapterId),
+      );
+    }
   };
 
   const handleGenerateStory = async () => {
@@ -129,8 +172,11 @@ export const GamePage = () => {
 
   return (
     <PlayScene
-      key={currentNode.id}
+      chapterAudioStatus={chapterAudioStatusById[currentChapterCacheKey] ?? null}
       currentChapterTitle={currentChapter.title}
+      currentChapterId={currentChapter.id}
+      hasPreGeneratedChapterAudio={preGeneratedChapterIds.includes(currentChapterCacheKey)}
+      isPreGeneratingChapter={preGeneratingChapterIds.includes(currentChapterCacheKey)}
       node={currentNode}
       preferences={preferences}
       progress={progress}

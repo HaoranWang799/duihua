@@ -15,10 +15,14 @@ import { PreferencesModal } from './PreferencesModal';
 import { Subtitle } from './Subtitle';
 
 type PlaySceneProps = {
+  chapterAudioStatus: string | null;
+  currentChapterId: string;
   node: StoryNode;
   preferences: StoryPreferences;
   progress: StoryProgress;
   currentChapterTitle: string;
+  hasPreGeneratedChapterAudio: boolean;
+  isPreGeneratingChapter: boolean;
   onChoose: (nextId: string) => void;
   onOpenMap: () => void;
   onPreGenerateChapterAudio: () => Promise<string>;
@@ -35,10 +39,14 @@ type PlaySceneProps = {
 };
 
 export const PlayScene = ({
+  chapterAudioStatus,
+  currentChapterId,
   node,
   preferences,
   progress,
   currentChapterTitle,
+  hasPreGeneratedChapterAudio,
+  isPreGeneratingChapter,
   onChoose,
   onOpenMap,
   onPreGenerateChapterAudio,
@@ -50,8 +58,6 @@ export const PlayScene = ({
   visual,
 }: PlaySceneProps) => {
   const [preferencesOpen, setPreferencesOpen] = useState(false);
-  const [chapterWarmStatus, setChapterWarmStatus] = useState<string | null>(null);
-  const [isPreGeneratingChapter, setIsPreGeneratingChapter] = useState(false);
   const {
     activeSubtitle,
     isPaused,
@@ -63,6 +69,11 @@ export const PlayScene = ({
     voiceError,
   } = useNodePlayback(node, preferences);
   const isEnding = isEndingNode(node);
+  const chapterAudioButtonLabel = isPreGeneratingChapter
+    ? '缓存中'
+    : hasPreGeneratedChapterAudio
+      ? '已缓存'
+      : '预生成';
 
   return (
     <main className="play-scene">
@@ -151,25 +162,18 @@ export const PlayScene = ({
                 <button
                   className="play-scene__ghost play-scene__ghost--text play-scene__ghost--inline"
                   type="button"
-                  disabled={isPreGeneratingChapter}
+                  disabled={isPreGeneratingChapter || hasPreGeneratedChapterAudio}
                   onClick={async () => {
-                    setIsPreGeneratingChapter(true);
-                    setChapterWarmStatus(`正在缓存《${currentChapterTitle}》语音…`);
-
                     try {
-                      const status = await onPreGenerateChapterAudio();
-                      setChapterWarmStatus(status);
-                    } catch (error) {
-                      const message =
-                        error instanceof Error ? error.message : '整章语音预生成失败。';
-                      setChapterWarmStatus(message);
-                    } finally {
-                      setIsPreGeneratingChapter(false);
+                      await onPreGenerateChapterAudio();
+                    } catch {
+                      // Status is already reflected at the page level.
                     }
                   }}
-                  aria-label="预生成整章语音"
+                  aria-label={`预生成 ${currentChapterTitle} 语音`}
+                  data-chapter-id={currentChapterId}
                 >
-                  {isPreGeneratingChapter ? '缓存中' : '预生成'}
+                  {chapterAudioButtonLabel}
                 </button>
                 <AudioPlayer
                   isPreparingAudio={isPreparingAudio}
@@ -187,8 +191,8 @@ export const PlayScene = ({
         </section>
 
         <section className="play-scene__choices">
-          {chapterWarmStatus ? (
-            <p className="play-scene__status-banner">{chapterWarmStatus}</p>
+          {chapterAudioStatus ? (
+            <p className="play-scene__status-banner">{chapterAudioStatus}</p>
           ) : null}
           {isEnding && showChoices ? (
             <EndingScreen
